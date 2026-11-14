@@ -43,6 +43,7 @@ import (
 
 	"github.com/yawaflua/marusya-gemini/internal/agent"
 	"github.com/yawaflua/marusya-gemini/internal/audio/alsa"
+	"github.com/yawaflua/marusya-gemini/internal/audio/asoundconf"
 	"github.com/yawaflua/marusya-gemini/internal/config"
 	"github.com/yawaflua/marusya-gemini/internal/controller"
 	"github.com/yawaflua/marusya-gemini/internal/controller/airplay"
@@ -87,6 +88,7 @@ var (
 
 	captureDevice  = flag.String("capture_device", config.Env("MARUSYA_CAPTURE_DEVICE", "default"), "ALSA capture PCM.")
 	playbackDevice = flag.String("playback_device", config.Env("MARUSYA_PLAYBACK_DEVICE", "default"), "ALSA playback PCM.")
+	asoundConf     = flag.String("asound_conf", config.Env("MARUSYA_ASOUND_CONF", "/etc/asound.conf"), "ALSA config with the speaker equalizer, written by the installer. On start the agent updates it to its built-in copy, keeping bands set in the web panel; a file without \"# marusya-eq:\" lines is left alone. Empty disables the equalizer.")
 
 	wakeCommand  = flag.String("wake_command", config.Env("MARUSYA_WAKE_COMMAND", ""), "Keyword spotter command: reads 16 kHz mono S16LE PCM on stdin, prints a line per detection.")
 	wakeCooldown = flag.Duration("wake_cooldown", 1500*time.Millisecond, "Ignore repeated keyword detections within this period.")
@@ -232,6 +234,21 @@ func run() error {
 
 	// Device controllers. Leave interfaces nil to disable an area.
 	dispatcher := &controller.Dispatcher{}
+	if *asoundConf != "" {
+		eq := asoundconf.New(*asoundConf)
+		changed, err := eq.Sync()
+		switch {
+		case err == nil:
+			dispatcher.Equalizer = eq
+			if changed {
+				log.Info("asound.conf updated", "path", *asoundConf)
+			}
+		case errors.Is(err, asoundconf.ErrUnmanaged), errors.Is(err, os.ErrNotExist):
+			log.Info("equalizer disabled: asound.conf is not set up by the installer", "path", *asoundConf)
+		default:
+			log.Warn("equalizer disabled", "err", err)
+		}
+	}
 	if *volumeCmd != "" {
 		dispatcher.Volume = &volumecmd.Volume{Command: *volumeCmd}
 	} else if *mixerControl != "" {
