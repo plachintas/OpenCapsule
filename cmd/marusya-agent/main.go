@@ -129,7 +129,7 @@ var (
 
 	touchKeys      = flag.String("touch_keys", config.Env("MARUSYA_TOUCH_KEYS", "auto"), `Touch panel: "auto" (find "Hynitron CSK05T"), an evdev node, or empty to disable.`)
 	touchCenterKey = flag.Uint("touch_center_key", touchkeys.KeyVoice, "Key code of the centre key that activates the assistant.")
-	touchMediaKeys = flag.Bool("touch_media_keys", config.EnvBool("MARUSYA_TOUCH_MEDIA_KEYS", true), "While music plays, a short press of the centre key pauses it (and, pressed again within 10 minutes, plays on), a tap on volume up/down skips to the next/previous track; holding a volume key still changes the volume.")
+	touchMediaKeys = flag.Bool("touch_media_keys", config.EnvBool("MARUSYA_TOUCH_MEDIA_KEYS", true), "While music plays, a short press of the centre key pauses it (and, pressed again within 10 minutes, plays on), a double tap on volume up/down skips to the next/previous track; a single press or holding changes the volume as always.")
 
 	ringMode          = flag.String("ring", config.Env("MARUSYA_RING", "auto"), `LED ring: "auto" (on a VK Capsula Mini, by its device tree), "on" or empty to disable.`)
 	ringDev           = flag.String("ring_dev", config.Env("MARUSYA_RING_DEV", ringled.DefaultDevice), "spidev node of the LED ring.")

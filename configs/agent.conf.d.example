@@ -35,8 +35,9 @@ MARUSYA_WAKE_COMMAND=
 MARUSYA_BUTTON_DEVICE=
 
 # Touch panel while music plays: a short press of the centre key pauses it
-# (pressed again within 10 minutes, plays on), a tap on VOL+/VOL- skips to
-# the next/previous track, holding a volume key still changes the volume.
+# (pressed again within 10 minutes, plays on), a double tap on VOL+/VOL-
+# skips to the next/previous track; a single press or holding changes the
+# volume as always.
 # Without music the keys work as before. false: centre = assistant always.
 MARUSYA_TOUCH_MEDIA_KEYS=true
 

@@ -233,7 +233,8 @@ func TestPanelMediaKeys(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Device = fifo
 	cfg.RepeatDelay = 80 * time.Millisecond
-	cfg.RepeatInterval = time.Hour // one volume step per hold
+	cfg.RepeatInterval = time.Hour // one repeated step per hold
+	cfg.DoubleTap = 100 * time.Millisecond
 	p := &Panel{
 		Config:     cfg,
 		Dispatcher: &controller.Dispatcher{Volume: vol, Media: media},
@@ -270,21 +271,52 @@ func TestPanelMediaKeys(t *testing.T) {
 		}
 	}
 
-	// Taps on the volume keys skip tracks.
-	tap(KeyVolumeUp)
-	expectOps("tap volume up", models.MediaNext)
-	tap(KeyVolumeDown)
-	expectOps("tap volume down", models.MediaPrevious)
+	level := func() int { st, _ := vol.Get(ctx); return st.Level }
 
-	// Holding changes the volume and does not skip.
-	send(KeyVolumeUp, 1)
-	time.Sleep(150 * time.Millisecond)
-	send(KeyVolumeUp, 0)
-	time.Sleep(50 * time.Millisecond)
-	if lvl, _ := vol.Get(ctx); lvl.Level != 55 {
-		t.Errorf("volume after a hold = %d, want 55", lvl.Level)
+	// A tap changes the volume as always, also while music plays.
+	tap(KeyVolumeUp)
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
+	if l := level(); l != 55 {
+		t.Errorf("volume after a tap = %d, want 55", l)
 	}
-	expectOps("hold volume up")
+	expectOps("tap volume up")
+
+	// A double tap skips the track and undoes the first step.
+	tap(KeyVolumeUp)
+	tap(KeyVolumeUp)
+	expectOps("double tap volume up", models.MediaNext)
+	if l := level(); l != 55 {
+		t.Errorf("volume after a double tap = %d, want 55", l)
+	}
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
+	tap(KeyVolumeDown)
+	tap(KeyVolumeDown)
+	expectOps("double tap volume down", models.MediaPrevious)
+	if l := level(); l != 55 {
+		t.Errorf("volume after a double tap down = %d, want 55", l)
+	}
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
+
+	// Two taps too far apart are two volume steps.
+	tap(KeyVolumeUp)
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
+	tap(KeyVolumeUp)
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
+	if l := level(); l != 65 {
+		t.Errorf("volume after two slow taps = %d, want 65", l)
+	}
+	expectOps("two slow taps")
+
+	// Holding: one step at once, more while held.
+	send(KeyVolumeDown, 1)
+	time.Sleep(150 * time.Millisecond)
+	send(KeyVolumeDown, 0)
+	time.Sleep(50 * time.Millisecond)
+	if l := level(); l != 55 {
+		t.Errorf("volume after a hold = %d, want 55 (two steps)", l)
+	}
+	expectOps("hold volume down")
+	time.Sleep(cfg.DoubleTap + 50*time.Millisecond)
 
 	// The centre key pauses, then plays on; no assistant.
 	tap(KeyVoice)
@@ -302,15 +334,16 @@ func TestPanelMediaKeys(t *testing.T) {
 	busy.Store(false)
 
 	// Music paused some other way: the centre key is the assistant again,
-	// and the volume keys change the volume at once.
+	// and a double tap is just two volume steps.
 	media.set(false)
 	tap(KeyVoice)
 	expectWake("centre with paused music", true)
 	expectOps("centre with paused music")
 	tap(KeyVolumeDown)
+	tap(KeyVolumeDown)
 	time.Sleep(50 * time.Millisecond)
-	if lvl, _ := vol.Get(ctx); lvl.Level != 50 {
-		t.Errorf("volume after a tap without music = %d, want 50", lvl.Level)
+	if l := level(); l != 45 {
+		t.Errorf("volume after a double tap without music = %d, want 45", l)
 	}
-	expectOps("tap volume down without music")
+	expectOps("double tap without music")
 }

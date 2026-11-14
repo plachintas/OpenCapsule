@@ -22,10 +22,13 @@
 //
 // With [Config.MediaKeys], while music plays (see [models.MediaStatus]):
 //
-//	VOL+ / VOL-, tap    next / previous track
-//	VOL+ / VOL-, hold   volume, as above, from [Config.RepeatDelay] on
-//	centre, short       pause; pressed again within [Config.ResumeWindow],
-//	                    play on
+//	VOL+ / VOL-, double tap   next / previous track; the volume step of
+//	                          the first tap is undone
+//	centre, short             pause; pressed again within
+//	                          [Config.ResumeWindow], play on
+//
+// A single press and holding change the volume as always, so the volume
+// keys never lose their main job.
 //
 // [Panel] is a [wakeword.Detector], so the centre key activates the agent
 // exactly like a wake word.
@@ -72,9 +75,12 @@ type Config struct {
 	// PairTimeout is passed to [controller.Bluetooth.Pair].
 	PairTimeout time.Duration
 	// MediaKeys makes the keys control the track while music plays: a
-	// volume key released before RepeatDelay skips the track, the centre
-	// key pauses and resumes.
+	// double tap on a volume key skips the track, the centre key pauses
+	// and resumes.
 	MediaKeys bool
+	// DoubleTap is the longest gap between the release of a volume key
+	// and the next press of it that makes a double tap.
+	DoubleTap time.Duration
 	// ResumeWindow is how long after a pause by the centre key a short
 	// press plays on instead of activating the assistant.
 	ResumeWindow time.Duration
@@ -95,6 +101,7 @@ func DefaultConfig() Config {
 		RepeatInterval: 150 * time.Millisecond,
 		PairTimeout:    2 * time.Minute,
 		MediaKeys:      true,
+		DoubleTap:      350 * time.Millisecond,
 		ResumeWindow:   10 * time.Minute,
 	}
 }
@@ -182,15 +189,19 @@ func (p *Panel) Run(ctx context.Context, _ <-chan []byte, out chan<- wakeword.De
 		repT    *time.Timer
 		repC    <-chan time.Time
 		repD    int
-		// tapKey is a volume key pressed while music plays: released
-		// before the repeat starts, it skips the track.
-		tapKey uint16
+		// repeated: the volume key being held started auto-repeat.
+		repeated bool
+		// pressLevel is the volume before the current volume press.
+		pressLevel int
+		pressOK    bool
+		// lastTap is a short volume press, the first half of a double tap.
+		lastTap tap
 	)
 	stopRepeat := func() {
 		if repT != nil {
 			repT.Stop()
 		}
-		repC, repD, tapKey = nil, 0, 0
+		repC, repD, repeated = nil, 0, false
 	}
 	for {
 		select {
@@ -200,7 +211,7 @@ func (p *Panel) Run(ctx context.Context, _ <-chan []byte, out chan<- wakeword.De
 			return err
 
 		case <-repC:
-			tapKey = 0 // held: it is a volume change after all
+			repeated = true
 			p.adjustVolume(ctx, repD)
 			repT = time.NewTimer(p.Config.RepeatInterval)
 			repC = repT.C
@@ -219,23 +230,28 @@ func (p *Panel) Run(ctx context.Context, _ <-chan []byte, out chan<- wakeword.De
 			}
 			switch ev.Code {
 			case p.Config.VolumeUpKey, p.Config.VolumeDownKey:
-				if !pressed && tapKey == ev.Code {
-					p.skip(ctx, ev.Code == p.Config.VolumeUpKey)
+				if !pressed {
+					// A short press may start a double tap.
+					lastTap = tap{}
+					if repC != nil && !repeated && pressOK {
+						lastTap = tap{code: ev.Code, at: time.Now(), level: pressLevel}
+					}
+					stopRepeat()
+					continue
 				}
 				stopRepeat()
-				if pressed {
-					repD = p.Config.VolumeStep
-					if ev.Code == p.Config.VolumeDownKey {
-						repD = -repD
-					}
-					if p.Config.MediaKeys && p.mediaStatus(ctx).Playing {
-						tapKey = ev.Code // decided on release or by the timer
-					} else {
-						p.adjustVolume(ctx, repD)
-					}
-					repT = time.NewTimer(p.Config.RepeatDelay)
-					repC = repT.C
+				if p.doubleTap(ctx, lastTap, ev.Code) {
+					lastTap = tap{}
+					continue // no volume change and no repeat for this press
 				}
+				lastTap = tap{}
+				repD = p.Config.VolumeStep
+				if ev.Code == p.Config.VolumeDownKey {
+					repD = -repD
+				}
+				pressLevel, pressOK = p.adjustVolume(ctx, repD)
+				repT = time.NewTimer(p.Config.RepeatDelay)
+				repC = repT.C
 
 			case p.Config.CenterKey:
 				if pressed {
@@ -275,21 +291,52 @@ func (p *Panel) activate(out chan<- wakeword.Detection) {
 	}
 }
 
-func (p *Panel) adjustVolume(ctx context.Context, delta int) {
+// adjustVolume changes the volume by delta and reports the level before.
+func (p *Panel) adjustVolume(ctx context.Context, delta int) (before int, ok bool) {
 	v := p.Dispatcher.Volume
 	if v == nil {
-		return
+		return 0, false
 	}
 	st, err := v.Get(ctx)
 	if err == nil {
-		level := max(0, min(100, st.Level+delta))
-		if err = v.Set(ctx, level); err == nil {
-			p.Display.Overlay(strconv.Itoa(level), 1500*time.Millisecond)
-			return
+		if err = p.setVolume(ctx, st.Level+delta); err == nil {
+			return st.Level, true
 		}
 	}
 	p.Logger.Warn("touch keys: volume", "err", err)
 	p.Display.Overlay("Err", time.Second)
+	return 0, false
+}
+
+func (p *Panel) setVolume(ctx context.Context, level int) error {
+	level = max(0, min(100, level))
+	if err := p.Dispatcher.Volume.Set(ctx, level); err != nil {
+		return err
+	}
+	p.Display.Overlay(strconv.Itoa(level), 1500*time.Millisecond)
+	return nil
+}
+
+// tap is a short press of a volume key.
+type tap struct {
+	code  uint16
+	at    time.Time // release
+	level int       // volume before the press
+}
+
+// doubleTap handles the second press of a double tap on a volume key with
+// [Config.MediaKeys] while music plays: it undoes the volume step of the
+// first tap and skips the track. It reports whether the press was used.
+func (p *Panel) doubleTap(ctx context.Context, last tap, code uint16) bool {
+	if !p.Config.MediaKeys || last.code != code || time.Since(last.at) > p.Config.DoubleTap ||
+		!p.mediaStatus(ctx).Playing {
+		return false
+	}
+	if err := p.setVolume(ctx, last.level); err != nil {
+		p.Logger.Warn("touch keys: volume", "err", err)
+	}
+	p.skip(ctx, code == p.Config.VolumeUpKey)
+	return true
 }
 
 func (p *Panel) pair() {

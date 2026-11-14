@@ -126,7 +126,7 @@ var registry = []Tool{
 	},
 	{
 		Action:      models.ActionMediaStatus,
-		Description: "Returns whether music is playing and the current track title.",
+		Description: "Returns whether music is playing, the current track title and where it comes from.",
 	},
 	{
 		Action:      models.ActionBluetoothPair,
