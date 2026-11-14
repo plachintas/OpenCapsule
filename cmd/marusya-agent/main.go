@@ -129,6 +129,7 @@ var (
 
 	touchKeys      = flag.String("touch_keys", config.Env("MARUSYA_TOUCH_KEYS", "auto"), `Touch panel: "auto" (find "Hynitron CSK05T"), an evdev node, or empty to disable.`)
 	touchCenterKey = flag.Uint("touch_center_key", touchkeys.KeyVoice, "Key code of the centre key that activates the assistant.")
+	touchMediaKeys = flag.Bool("touch_media_keys", config.EnvBool("MARUSYA_TOUCH_MEDIA_KEYS", true), "While music plays, a short press of the centre key pauses it (and, pressed again within 10 minutes, plays on), a tap on volume up/down skips to the next/previous track; holding a volume key still changes the volume.")
 
 	ringMode          = flag.String("ring", config.Env("MARUSYA_RING", "auto"), `LED ring: "auto" (on a VK Capsula Mini, by its device tree), "on" or empty to disable.`)
 	ringDev           = flag.String("ring_dev", config.Env("MARUSYA_RING_DEV", ringled.DefaultDevice), "spidev node of the LED ring.")
@@ -358,6 +359,7 @@ func run() error {
 	if *touchKeys != "" {
 		cfg := touchkeys.DefaultConfig()
 		cfg.CenterKey = uint16(*touchCenterKey)
+		cfg.MediaKeys = *touchMediaKeys
 		if *touchKeys != "auto" {
 			cfg.Device = *touchKeys
 		}
@@ -461,6 +463,7 @@ func run() error {
 		defer streams.Stop()
 	}
 	if touch != nil {
+		touch.Busy = a.Busy
 		touch.OnMicMute = func(muted bool) {
 			a.SetMicMuted(muted)
 			surf.SetMicMuted(muted)
