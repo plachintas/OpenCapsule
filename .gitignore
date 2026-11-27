@@ -5,3 +5,9 @@
 
 # Server plugins mounted by deploy/server/docker-compose.yaml.
 /plugins/
+
+# Binaries built in place and Python caches.
+/marusya-agent
+/marusya-server
+__pycache__/
+*.pyc
