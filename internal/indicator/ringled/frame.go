@@ -43,8 +43,10 @@ func (c RGB) String() string { return fmt.Sprintf("%02x%02x%02x", c.R, c.G, c.B)
 // The wire format (WS2812-style chain
 // on the meson-spicc SPI controller at 3.34 MHz):
 //
-//   - every data bit is four SPI bits, 1000 for 0 and 1100 for 1, so a byte
-//     carries two data bits: 00→88, 01→8c, 10→c8, 11→cc;
+//   - every data bit is four SPI bits, 1000 for 0 (299 ns high) and 1100
+//     for 1 (598 ns high), so a byte carries two data bits:
+//     00→88, 01→8c, 10→c8, 11→cc. Verified against `ringled --dump` of the
+//     hand-tested tool that drives this ring (byte-for-byte identical);
 //   - pixels in chain order, channels G, R, B, most significant bit first;
 //   - resetBytes zero bytes before and after the data latch the frame;
 //   - the buffer is sent with 64-bit SPI words (DMA rather than PIO, which
@@ -52,8 +54,9 @@ func (c RGB) String() string { return fmt.Sprintf("%02x%02x%02x", c.R, c.G, c.B)
 const (
 	resetBytes = 128
 	spiSpeed   = 3340000
-	// primeSpeed is the rate of a short dummy transfer before every frame;
-	// changing the rate makes the driver reprogram its clock divider.
+	// primeSpeed is the rate of a short dummy transfer sent in the same
+	// message as the frame: changing the rate makes the driver reprogram its
+	// clock divider, which the rebind alone does not survive.
 	primeSpeed = 1000000
 	primeBytes = 16
 )

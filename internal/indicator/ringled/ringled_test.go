@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -329,5 +330,66 @@ func TestLEDStrip(t *testing.T) {
 	// A regular file keeps the tail of a longer old value; sysfs does not.
 	if got, _ := strconv.Atoi(read(36)); got != 0 {
 		t.Errorf("top-led36 = %d, want 0", got)
+	}
+}
+
+// TestStripRebindOnDemand pins the two ways the spidev node can be missing:
+// NewSPI repairs an unbound controller once and then writes every later frame
+// without a rebind, NewSPIRebind keeps the legacy unbind/bind per frame for
+// kernels that lose ENH_CTL0. spiDriver is a directory of files here, so the
+// test watches what the strip writes into bind and unbind.
+func TestStripRebindOnDemand(t *testing.T) {
+	dir := t.TempDir()
+	driver := filepath.Join(dir, "meson-spicc")
+	if err := os.Mkdir(driver, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const name = "ffd13000.spi"
+	for _, f := range []string{"unbind", "bind", name} {
+		if err := os.WriteFile(filepath.Join(driver, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dev := filepath.Join(dir, "spidev0.0")
+	if err := os.WriteFile(dev, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer func(d string) { spiDriver = d }(spiDriver)
+	spiDriver = driver
+
+	// A node that is there: open it, leave the controller alone.
+	s := NewSPI(dev).(*spiStrip)
+	fd, err := s.open()
+	if err != nil {
+		t.Fatalf("open with the node present: %v", err)
+	}
+	syscall.Close(fd)
+	if b, _ := os.ReadFile(filepath.Join(driver, "unbind")); len(b) != 0 {
+		t.Fatalf("a frame with the node present rebound the controller: unbind=%q", b)
+	}
+
+	// The legacy strip rebinds before every frame, node or no node.
+	r := NewSPIRebind(dev).(*spiStrip)
+	if fd, err = r.open(); err != nil {
+		t.Fatalf("rebind strip: %v", err)
+	}
+	syscall.Close(fd)
+	if b, _ := os.ReadFile(filepath.Join(driver, "unbind")); string(b) != name {
+		t.Fatalf("NewSPIRebind did not unbind before the frame: unbind=%q", b)
+	}
+
+	// A node left unbound is repaired: the strip tries to bind and then says
+	// it could not open the node, because nothing recreates it here.
+	if err := os.Remove(dev); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(driver, "unbind"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.open(); err == nil {
+		t.Fatal("open succeeded without the node")
+	}
+	if b, _ := os.ReadFile(filepath.Join(driver, "unbind")); string(b) != name {
+		t.Fatalf("a missing node did not trigger a repair: unbind=%q", b)
 	}
 }

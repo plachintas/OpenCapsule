@@ -54,16 +54,40 @@ func Detect() bool {
 	return err == nil
 }
 
-// spiStrip writes frames to spidev directly: the meson-spicc driver only clocks the first transfer after a bind
-// at the requested rate, so the controller is rebound before every frame.
-// That costs a few milliseconds, still fine for 30 frames a second.
+// spiStrip writes frames to spidev directly. Two quirks of the meson-spicc
+// driver matter here:
+//
+//   - the divider rate lives in ENH_CTL0, and unprepare_transfer() resets the
+//     controller. Kernels with the upstream-most fix (spi-meson-spicc saved
+//     ENH_CTL0 and restores it in prepare_message(), linux 6.18.63 and later
+//     on the VK Capsula Mini branch) program it again on every message, so
+//     frames need nothing extra. Kernels without that fix leave it zeroed and
+//     the clk framework keeps the rate cached, so clk_set_rate() never writes
+//     it again: there each frame needs the controller rebound
+//     ([NewSPIRebind]);
+//   - the frame is sent as the second transfer of the message, behind a short
+//     primer at another rate, so the divider is reprogrammed even when the
+//     rate is unchanged.
+//
+// A single write() also breaks the frame every 16 bytes (PIO bursts), hence
+// bitsPerWord = 64, which selects the DMA path.
 type spiStrip struct {
-	dev string
-	rx  []byte
+	dev    string
+	rebind bool // unbind and bind the controller before every frame
+	rx     []byte
 }
 
-// NewSPI returns a strip on the spidev node dev.
+// NewSPI returns a strip on the spidev node dev, for kernels that keep
+// ENH_CTL0 across the controller being reset. A node left unbound by an
+// interrupted earlier run (or by a driver without the fix) is bound once, on
+// the first frame.
 func NewSPI(dev string) Strip { return &spiStrip{dev: dev} }
+
+// NewSPIRebind returns a strip that unbinds and binds the controller before
+// every frame: the workaround for kernels that lose ENH_CTL0 in
+// unprepare_transfer(). It costs a rebind per frame, so it is only for those
+// kernels.
+func NewSPIRebind(dev string) Strip { return &spiStrip{dev: dev, rebind: true} }
 
 // spiTransfer is struct spi_ioc_transfer.
 type spiTransfer struct {
@@ -83,15 +107,15 @@ const spiIOCMessage2 = 0x40000000 | (2*32)<<16 | 'k'<<8
 
 func (s *spiStrip) Write(f Frame) error {
 	tx := encode(f)
+	if path := os.Getenv("MARUSYA_RING_DUMP"); path != "" {
+		_ = os.WriteFile(path, tx, 0o644)
+	}
 	if len(s.rx) < len(tx) {
 		s.rx = make([]byte, len(tx))
 	}
-	if err := rebindSPI(s.dev); err != nil {
-		return err
-	}
-	fd, err := syscall.Open(s.dev, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+	fd, err := s.open()
 	if err != nil {
-		return fmt.Errorf("open %s: %w", s.dev, err)
+		return err
 	}
 	defer syscall.Close(fd)
 
@@ -114,6 +138,36 @@ func (s *spiStrip) Write(f Frame) error {
 		return fmt.Errorf("SPI_IOC_MESSAGE on %s: %w", s.dev, errno)
 	}
 	return nil
+}
+
+// open returns a descriptor on the spidev node. A node that is not there was
+// left unbound by an interrupted earlier run, or by a driver that unbinds when
+// it is done; binding it once repairs the ring for every later frame. Kernels
+// that lose ENH_CTL0 need the rebind before each frame instead, and ask for it
+// with [NewSPIRebind].
+func (s *spiStrip) open() (int, error) {
+	if s.rebind {
+		if err := rebindSPI(s.dev); err != nil {
+			return -1, err
+		}
+		return s.openNode()
+	}
+	fd, err := s.openNode()
+	if err == nil {
+		return fd, nil
+	}
+	if rerr := rebindSPI(s.dev); rerr != nil {
+		return -1, err
+	}
+	return s.openNode()
+}
+
+func (s *spiStrip) openNode() (int, error) {
+	fd, err := syscall.Open(s.dev, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open %s: %w", s.dev, err)
+	}
+	return fd, nil
 }
 
 // rebindSPI unbinds and binds the meson-spicc controllers and waits for dev

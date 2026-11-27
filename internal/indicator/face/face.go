@@ -353,6 +353,9 @@ func (f *Face) showManual() bool {
 	case "clock":
 		now := f.now()
 		err = f.r.Text(now.Format("1504"))
+		if c, ok := f.r.(interface{ Colon(bool) }); ok {
+			c.Colon(true)
+		}
 		hold = min(hold, now.Truncate(time.Minute).Add(time.Minute).Sub(now))
 	case "off":
 		err = f.r.Show([4]byte{}, false)

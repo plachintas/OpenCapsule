@@ -68,6 +68,13 @@ type Panel struct {
 
 	noseLevel int // nose LED brightness when on
 
+	// colons are the LED class directories of the colon dots: this panel has
+	// two of them (clock:colon:top and clock:colon:bottom), and a clock face
+	// wants both, while the "nose" of the face is only the lower one.
+	colons  []string
+	colonOn bool
+	pct     int // last brightness percentage, for the colon dots
+
 	// segs are the LED class directories of each digit's segments a..g, if
 	// the panel exposes them; then segments are driven directly.
 	segs    *[4][7]string
@@ -155,7 +162,9 @@ func openLEDs(segs *[4][7]string, nose string) *Panel {
 			n = path
 		}
 	}
-	p := &Panel{nose: n, noseLevel: 255, base: builtinMap, segs: segs, written: map[string]int{}}
+	p := &Panel{nose: n, noseLevel: 255, base: builtinMap, segs: segs, written: map[string]int{}, pct: 100}
+	p.colons = findColons(n)
+
 	for _, digit := range segs {
 		for _, path := range digit {
 			writeFile(filepath.Join(path, "trigger"), []byte("none"))
@@ -182,7 +191,10 @@ func Open(dev, nose string) (*Panel, error) {
 			return nil, err
 		}
 	}
-	p := &Panel{dir: dev, nose: findNose(nose), noseLevel: 255}
+	np := findNose(nose)
+	p := &Panel{dir: dev, nose: np, noseLevel: 255, pct: 100}
+	p.colons = findColons(np)
+
 	raw, err := os.ReadFile(filepath.Join(dev, "map_seg7"))
 	if err != nil {
 		return nil, fmt.Errorf("seg7: read map_seg7: %w", err)
@@ -368,6 +380,25 @@ func findLinedisp() (string, error) {
 	return found, nil
 }
 
+// findColons returns the LED class directories of the colon dots. The panel
+// has two of them; on a line-display panel there is none and the list stays
+// empty.
+func findColons(nose string) []string {
+	var out []string
+	ents, _ := os.ReadDir("/sys/class/leds")
+	for _, en := range ents {
+		n := strings.ToLower(en.Name())
+		if strings.Contains(n, "colon") || strings.Contains(n, "dot") {
+			out = append(out, "/sys/class/leds/"+en.Name())
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 && nose != "" {
+		out = append(out, nose)
+	}
+	return out
+}
+
 func findNose(v string) string {
 	switch {
 	case v == "none":
@@ -409,6 +440,13 @@ func writeFile(path string, data []byte) error {
 }
 
 func (p *Panel) setNose(on bool) {
+	if p.colonOn {
+		// Any text or face frame blanks the colon dots first: only the clock
+		// turns them on, and it does so after rendering the digits. Without
+		// this a face frame would keep the upper dot lit from the clock.
+		p.colonOn = false
+		p.writeColons()
+	}
 	if p.nose == "" {
 		return
 	}
@@ -418,6 +456,28 @@ func (p *Panel) setNose(on bool) {
 		v = strconv.Itoa(max(1, p.noseLevel))
 	}
 	writeFile(filepath.Join(p.nose, "brightness"), []byte(v))
+}
+
+// Colon turns the colon dots on or off: a clock face calls it right after
+// Text, which draws the digits with the dots off.
+func (p *Panel) Colon(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.colonOn = on
+	p.writeColons()
+}
+
+// writeColons applies the current colon state to every colon dot. The caller
+// holds the lock.
+func (p *Panel) writeColons() {
+	for _, dir := range p.colons {
+		writeFile(filepath.Join(dir, "trigger"), []byte("none"))
+		v := "0"
+		if p.colonOn {
+			v = strconv.Itoa(max(1, scaled(filepath.Join(dir, "max_brightness"), p.pct, 255)))
+		}
+		writeFile(filepath.Join(dir, "brightness"), []byte(v))
+	}
 }
 
 // ErrNoBrightness is returned when the panel has no brightness control.
@@ -430,8 +490,12 @@ func (p *Panel) SetBrightness(pct int) error {
 	pct = max(1, min(100, pct))
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.pct = pct
 	if p.nose != "" {
 		p.noseLevel = scaled(filepath.Join(p.nose, "max_brightness"), pct, 255)
+	}
+	if p.colonOn {
+		p.writeColons()
 	}
 	if p.segs != nil {
 		level := scaled(filepath.Join(p.segs[0][0], "max_brightness"), pct, 255)
