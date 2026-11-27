@@ -61,9 +61,13 @@ type deviceSession struct {
 
 	token string // the Bearer token the device connected with
 
-	mu         sync.Mutex
-	ps         provider.Session
-	retiring   bool          // ps received GoAway and must be replaced on next turn
+	mu       sync.Mutex
+	ps       provider.Session
+	retiring bool // ps received GoAway and must be replaced on next turn
+	used     bool // ps carried a turn; only then is it worth warming another
+	// resume is the provider handle of the last resumable session: the next
+	// connection continues that conversation instead of starting over.
+	resume     string
 	opened     time.Time     // when ps was opened
 	connecting chan struct{} // closed when a pending connection attempt ends
 	turnID     string
@@ -392,7 +396,12 @@ func (d *deviceSession) session() (provider.Session, error) {
 			ps, err = nil, d.ctx.Err()
 		}
 		if err == nil {
-			d.ps, d.opened = ps, time.Now()
+			d.ps, d.opened, d.used = ps, time.Now(), false
+			// Arm the idle timer from the moment of the open: a session
+			// warmed up ahead of a turn must not outlive IdleTimeout, or the
+			// provider drops it first and every warm-up costs a handshake
+			// that nobody needed.
+			d.resetIdleLocked()
 		}
 		d.mu.Unlock()
 		close(ch)
@@ -418,18 +427,41 @@ func (d *deviceSession) connect() (provider.Session, error) {
 	ctx, cancel := context.WithTimeout(d.ctx, connectTimout)
 	defer cancel()
 	start := time.Now()
-	ps, err := d.cfg.Provider.Connect(ctx, provider.SessionOptions{
+	opts := provider.SessionOptions{
 		SystemInstruction: set.SystemInstruction + pluginInstructions(d.srv.plugins) + d.deviceContext() + languagesNote(lang, e.ExtraLanguages),
 		Language:          lang,
 		ExtraLanguages:    extraLanguages(lang, e.ExtraLanguages),
 		InputFormat:       d.hello.InputFormat,
 		Tools:             slices.Concat(tools.For(d.hello.Capabilities), d.cfg.Skills.Tools(), d.pluginTools()),
 		ServerVAD:         d.vad,
-	})
+	}
+	if d.cfg.Resume {
+		d.mu.Lock()
+		opts.ResumeHandle = d.resume
+		d.mu.Unlock()
+	}
+	ps, err := d.cfg.Provider.Connect(ctx, opts)
+	if err != nil && opts.ResumeHandle != "" {
+		// A handle the backend refuses - expired, or not resumable at this
+		// point - must not cost the device its connection: drop it and start
+		// a new conversation.
+		d.log.Warn("resume provider session", "err", err)
+		d.mu.Lock()
+		d.resume = ""
+		d.mu.Unlock()
+		opts.ResumeHandle = ""
+		ps, err = d.cfg.Provider.Connect(ctx, opts)
+	}
 	if err != nil {
 		return nil, err
 	}
-	d.log.Info("provider session opened", "provider", d.cfg.Provider.Name(), "latency", time.Since(start))
+	// Say which of the two happened: a resumed conversation is what makes the
+	// speaker remember the previous one, so it must be visible in the log.
+	if opts.ResumeHandle != "" {
+		d.log.Info("provider session resumed", "provider", d.cfg.Provider.Name(), "latency", time.Since(start))
+	} else {
+		d.log.Info("provider session opened", "provider", d.cfg.Provider.Name(), "latency", time.Since(start))
+	}
 	d.srv.events.devicesChanged()
 	return ps, nil
 }
@@ -449,6 +481,7 @@ func (d *deviceSession) stale() bool {
 func (d *deviceSession) providerChanged() {
 	d.mu.Lock()
 	d.retiring = d.ps != nil
+	d.resume = ""
 	busy := d.inTurn || d.awaiting
 	d.mu.Unlock()
 	if !busy {
@@ -546,6 +579,18 @@ func (d *deviceSession) deviceContext() string {
 	return b.String()
 }
 
+// isIdleClose reports the Live API's inactivity close: the provider drops a
+// session that has not carried audio for a couple of minutes, and a prewarmed
+// session idles exactly like that. The next turn reopens it, so this is a
+// normal end, not a failure.
+func isIdleClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "close 1008") && strings.Contains(msg, "client inactivity")
+}
+
 func (d *deviceSession) startTurn(turnID string) {
 	d.log.Debug("turn start", "turn", turnID)
 	ps, err := d.session()
@@ -553,6 +598,7 @@ func (d *deviceSession) startTurn(turnID string) {
 		d.mu.Lock()
 		d.turnID, d.inTurn, d.awaiting, d.suppress = turnID, true, false, false
 		d.source, d.ending, d.output, d.retryText = SourceVoice, false, false, ""
+		d.used = true
 		d.heard.Reset()
 		d.said.Reset()
 		if d.idle != nil {
@@ -605,6 +651,10 @@ func (d *deviceSession) cancelTurn() {
 	pending := ps != nil && (d.inTurn || d.awaiting)
 	d.inTurn, d.awaiting = false, false
 	if pending {
+		// The session is dropped because the late reply must not be taken for
+		// the answer to the next turn, but the conversation itself is kept:
+		// being interrupted mid-answer is not a reason to forget what was
+		// said, so the handle stays and the next session resumes it.
 		d.ps, d.retiring, d.suppress = nil, false, false
 	}
 	d.mu.Unlock()
@@ -704,7 +754,7 @@ func (d *deviceSession) pump(ps provider.Session) {
 			ending := d.ending && d.ps == ps
 			if ending {
 				// The user said goodbye: the next activation starts afresh.
-				d.ending, d.ps = false, nil
+				d.ending, d.ps, d.resume = false, nil, ""
 			}
 			if heard != "" || said != "" {
 				d.turns++
@@ -724,6 +774,20 @@ func (d *deviceSession) pump(ps provider.Session) {
 				d.log.Info("conversation ended by the user; dropping the model session")
 				ps.Close()
 				d.prewarm()
+			}
+		case provider.EventResumeHandle:
+			// Only the current session may name the handle to continue:
+			// a late update from a session we already dropped would bring
+			// its stale context back.
+			d.log.Debug("session resumption update", "resumable", e.Resumable, "handle", len(e.Handle))
+			if e.Resumable && e.Handle != "" {
+				d.mu.Lock()
+				if d.ps == ps {
+					d.resume = e.Handle
+				} else {
+					d.log.Debug("session resumption handle from a stale session; ignored")
+				}
+				d.mu.Unlock()
 			}
 		case provider.EventGoAway:
 			d.log.Info("provider requested reconnect")
@@ -761,11 +825,19 @@ func (d *deviceSession) pump(ps provider.Session) {
 		d.srv.events.devicesChanged()
 	}
 	if err := ps.Err(); err != nil {
-		d.log.Warn("provider session failed", "err", err)
-		d.srv.events.publish(Event{Kind: EventError, Session: d.id, Device: d.hello.DeviceID,
-			Error: "сессия модели: " + err.Error()})
-		if pendingReply {
-			d.sendError(turnID, models.ErrorCodeUnavailable, err)
+		switch {
+		case isIdleClose(err):
+			// A prewarmed session that carried no audio for a couple of
+			// minutes is dropped by the provider; the next turn opens a new
+			// one. Not a failure, and not something to show in the panel.
+			d.log.Debug("provider session closed while idle", "err", err)
+		default:
+			d.log.Warn("provider session failed", "err", err)
+			d.srv.events.publish(Event{Kind: EventError, Session: d.id, Device: d.hello.DeviceID,
+				Error: "сессия модели: " + err.Error()})
+			if pendingReply {
+				d.sendError(turnID, models.ErrorCodeUnavailable, err)
+			}
 		}
 	}
 	if pendingReply {
@@ -787,13 +859,20 @@ func (d *deviceSession) expire() {
 		d.mu.Unlock()
 		return
 	}
-	ps := d.ps
-	d.ps = nil
+	ps, used := d.ps, d.used
+	d.ps, d.used = nil, false
 	d.mu.Unlock()
 	d.log.Info("closing idle provider session")
 	ps.Close()
 	d.srv.events.devicesChanged()
-	d.prewarm() // fresh context, ready for the next question
+	// Warm a replacement only if the closed session carried a turn. A session
+	// that was warmed up and never used means the user has been silent for
+	// IdleTimeout; warming again would open one that idles out exactly the
+	// same way, one handshake every IdleTimeout for nothing. The next turn
+	// opens a session on demand instead.
+	if used {
+		d.prewarm()
+	}
 }
 
 func (d *deviceSession) runTools(ps provider.Session, turnID string, calls []provider.ToolCall, suppressed bool) {
@@ -1029,6 +1108,7 @@ func (d *deviceSession) request(text, source string) error {
 	}
 	d.turnID, d.inTurn, d.awaiting, d.suppress = turnID, false, true, false
 	d.source, d.ending, d.output, d.retryText = source, false, false, text
+	d.used = true
 	d.heard.Reset()
 	d.heard.WriteString(text)
 	d.said.Reset()
@@ -1066,6 +1146,9 @@ func (d *deviceSession) refresh() {
 		return
 	}
 	d.retiring = true
+	// New settings mean a new persona: the old context is not the one the
+	// user asked for.
+	d.resume = ""
 	busy := d.inTurn || d.awaiting
 	d.mu.Unlock()
 	if !busy {
@@ -1081,7 +1164,7 @@ func (d *deviceSession) forget() error {
 		return errBusy
 	}
 	ps := d.ps
-	d.ps, d.retiring = nil, false
+	d.ps, d.retiring, d.resume = nil, false, ""
 	d.mu.Unlock()
 	if ps != nil {
 		d.log.Info("conversation reset from the panel")

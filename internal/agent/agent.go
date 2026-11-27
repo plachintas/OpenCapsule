@@ -57,6 +57,10 @@ type Config struct {
 
 	// VAD tunes the end-of-utterance detection.
 	VAD vad.Config
+	// MinUtterance is how much speech an utterance must hold before a turn is
+	// sent to the model. Shorter ones are clicks, coughs and the tail of the
+	// wake word: waking the model for them costs seconds of silence.
+	MinUtterance time.Duration
 	// PreRoll is how much audio before the detected speech onset is sent.
 	PreRoll time.Duration
 	// ResponseTimeout aborts a turn if the server does not answer.
@@ -86,6 +90,9 @@ type Config struct {
 func (c *Config) setDefaults() {
 	if c.VAD == (vad.Config{}) {
 		c.VAD = vad.DefaultConfig()
+	}
+	if c.MinUtterance == 0 {
+		c.MinUtterance = 250 * time.Millisecond
 	}
 	if c.PreRoll == 0 {
 		c.PreRoll = 300 * time.Millisecond
@@ -276,7 +283,7 @@ func (a *Agent) waitReconnect(ctx context.Context, d time.Duration) bool {
 			if a.muted.Load() {
 				continue
 			}
-			a.playEarcon(ctx, audio.EarconError)
+			a.PlayEarcon(ctx, audio.EarconError)
 			a.indicator.Show(indicator.Disconnected)
 		}
 	}
@@ -352,8 +359,8 @@ func (a *Agent) handshake(ctx context.Context, conn *transport.Conn) (*models.Re
 	return f.Message.Ready, nil
 }
 
-// playEarcon plays e asynchronously and returns its duration.
-func (a *Agent) playEarcon(ctx context.Context, e audio.Earcon) time.Duration {
+// PlayEarcon plays e asynchronously and returns its duration.
+func (a *Agent) PlayEarcon(ctx context.Context, e audio.Earcon) time.Duration {
 	if !a.cfg.Earcons {
 		return 0
 	}

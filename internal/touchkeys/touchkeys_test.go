@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yawaflua/marusya-gemini/internal/audio"
 	"github.com/yawaflua/marusya-gemini/internal/controller"
 	"github.com/yawaflua/marusya-gemini/internal/models"
 	"github.com/yawaflua/marusya-gemini/internal/wakeword"
@@ -90,6 +91,7 @@ func TestPanel(t *testing.T) {
 		muted  atomic.Bool
 		keysMu sync.Mutex
 		keys   []string
+		sounds []audio.Earcon
 	)
 	cfg := DefaultConfig()
 	cfg.Device = fifo
@@ -99,6 +101,11 @@ func TestPanel(t *testing.T) {
 		Dispatcher: &controller.Dispatcher{Volume: vol, Bluetooth: bt},
 		Display:    ov,
 		OnMicMute:  func(m bool) { muted.Store(m) },
+		OnSound: func(e audio.Earcon) {
+			keysMu.Lock()
+			sounds = append(sounds, e)
+			keysMu.Unlock()
+		},
 		OnKey: func(name string, _ uint16, pressed bool) {
 			if pressed {
 				keysMu.Lock()
@@ -162,6 +169,10 @@ func TestPanel(t *testing.T) {
 	keysMu.Lock()
 	if want := []string{"voice", "voice", "volume_up", "mic"}; !slices.Equal(keys, want) {
 		t.Errorf("OnKey presses = %v, want %v", keys, want)
+	}
+	// The volume key and the mute key answer with tones; nothing else does.
+	if want := []audio.Earcon{audio.EarconVolume, audio.EarconMute}; !slices.Equal(sounds, want) {
+		t.Errorf("sounds = %v, want %v", sounds, want)
 	}
 	keysMu.Unlock()
 	ov.mu.Lock()

@@ -69,6 +69,11 @@ type Config struct {
 	// ExtraLanguages are other languages users speak, e.g. "he-IL": comma
 	// separated BCP-47 codes, used as speech recognition hints.
 	ExtraLanguages string
+	// Resume continues the conversation across session restarts: the provider
+	// keeps a session resumable for a while after it was closed, and the next
+	// connection continues it instead of starting over. Off starts every
+	// session from scratch.
+	Resume bool
 	// IdleTimeout closes the model session after this period without turns.
 	// Conversation history is kept while the session is open, which allows
 	// follow-up questions.

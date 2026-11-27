@@ -40,7 +40,7 @@ import (
 var panelFiles embed.FS
 
 const (
-	panelCookie     = "marusya_panel"
+	panelCookie     = "marusya_panel2"
 	panelSessionTTL = 30 * 24 * time.Hour
 	maxPanelLogins  = 100
 	maxSayText      = 1000
@@ -227,7 +227,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     panelCookie,
 		Value:    token,
-		Path:     "/panel/",
+		Path:     "/",
 		MaxAge:   int(panelSessionTTL / time.Second),
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
@@ -238,7 +238,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.panel.logout(r)
-	http.SetCookie(w, &http.Cookie{Name: panelCookie, Value: "", Path: "/panel/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: panelCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -223,6 +223,10 @@ func translate(msg *genai.LiveServerMessage) []provider.Event {
 	if c := msg.ToolCallCancellation; c != nil && len(c.IDs) > 0 {
 		out = append(out, provider.Event{Kind: provider.EventToolCallCancel, CancelledIDs: c.IDs})
 	}
+	if u := msg.SessionResumptionUpdate; u != nil {
+		out = append(out, provider.Event{Kind: provider.EventResumeHandle,
+			Handle: u.NewHandle, Resumable: u.Resumable})
+	}
 	if msg.GoAway != nil {
 		out = append(out, provider.Event{Kind: provider.EventGoAway})
 	}

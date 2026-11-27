@@ -134,6 +134,11 @@ type SessionOptions struct {
 	// [Session.StartTurn] is a no-op, [Session.EndTurn] only flushes the
 	// audio stream and [EventSpeechEnd] reports the end of the utterance.
 	ServerVAD bool
+	// ResumeHandle continues the conversation of a session the backend still
+	// keeps resumable, instead of starting a new one. Empty starts afresh.
+	// The backend reports a handle in [EventResumeHandle] as the session
+	// progresses, and keeps it valid for a while after the session ends.
+	ResumeHandle string
 }
 
 // Session is a single stateful conversation with the model.
@@ -181,6 +186,11 @@ const (
 	EventGoAway
 	// EventSpeechEnd means the backend detected the end of user speech.
 	EventSpeechEnd
+	// EventResumeHandle carries the handle the session can be resumed with
+	// later, in Handle; Resumable reports whether the backend can resume it
+	// at this point. It arrives as the conversation progresses, so the last
+	// one that was resumable is the one to keep.
+	EventResumeHandle
 )
 
 func (k EventKind) String() string {
@@ -203,6 +213,8 @@ func (k EventKind) String() string {
 		return "go_away"
 	case EventSpeechEnd:
 		return "speech_end"
+	case EventResumeHandle:
+		return "resume_handle"
 	}
 	return "unknown"
 }
@@ -214,6 +226,10 @@ type Event struct {
 	Text         string
 	ToolCalls    []ToolCall
 	CancelledIDs []string
+	// Handle and Resumable carry the session resumption state, see
+	// [EventResumeHandle].
+	Handle    string
+	Resumable bool
 }
 
 // ToolCall is a function call requested by the model.

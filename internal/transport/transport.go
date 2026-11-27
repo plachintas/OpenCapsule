@@ -109,11 +109,14 @@ func (c *Conn) Read(ctx context.Context) (Frame, error) {
 // Ping checks that the peer is alive.
 func (c *Conn) Ping(ctx context.Context) error { return c.ws.Ping(ctx) }
 
-// KeepAlive pings the peer every interval until ctx is done or a ping fails.
-// A failed ping closes the connection, unblocking pending reads.
+// KeepAlive pings the peer every interval until ctx is done, and closes the
+// connection when two pings in a row fail. One lost ping is not a dead link: on
+// Wi-Fi a single stall would otherwise cost a full reconnect, and every
+// reconnect tears down whatever state the server kept for this stream.
 func (c *Conn) KeepAlive(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -122,10 +125,16 @@ func (c *Conn) KeepAlive(ctx context.Context, interval time.Duration) {
 			pctx, cancel := context.WithTimeout(ctx, interval)
 			err := c.ws.Ping(pctx)
 			cancel()
-			if err != nil {
-				c.ws.Close(websocket.StatusGoingAway, "ping timeout")
-				return
+			if err == nil {
+				failures = 0
+				continue
 			}
+			failures++
+			if failures < 2 {
+				continue
+			}
+			c.ws.Close(websocket.StatusGoingAway, "ping timeout")
+			return
 		}
 	}
 }

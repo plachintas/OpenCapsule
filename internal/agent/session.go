@@ -60,7 +60,11 @@ func (s state) indicator() indicator.State {
 	return indicator.Idle
 }
 
-const sendTimeout = 5 * time.Second
+// sendTimeout bounds one write to the server. The column sits on a congested
+// 2.4 GHz band where round trips of 100 ms are normal and a burst can stall for
+// seconds; at 5 s a stall closed the socket and the agent reconnected, losing
+// the wake word stream for a second or two.
+const sendTimeout = 12 * time.Second
 
 // idleBuffered is how much audio before the wake is kept for the replay. A
 // command said right after the wake word may be completely over by the time
@@ -82,6 +86,9 @@ type session struct {
 	turnSeq   int
 	turnID    string
 	speech    bool            // turn_start was sent for the current turn
+	confirmed bool            // ...and enough speech was heard to send it
+	speechDur time.Duration   // speech heard so far in the current utterance
+	pending   [][]byte        // utterance audio held until it is confirmed
 	maxDB     float64         // loudest frame of the current listening window
 	hp        *audio.HighPass // removes room rumble before the VAD
 	remote    bool            // the current turn was started by the server (remote_turn)
@@ -220,7 +227,7 @@ func (s *session) onWake(ctx context.Context, d wakeword.Detection) {
 		// spotter firing again is most likely hearing the same phrase.
 		if d.Source != "exec" && d.Source != "server" {
 			s.cancelListening(ctx, "activation pressed again")
-			s.a.playEarcon(ctx, audio.EarconDone)
+			s.a.PlayEarcon(ctx, audio.EarconDone)
 		}
 		return
 	case stateThinking, stateSpeaking:
@@ -237,6 +244,13 @@ func (s *session) onWake(ctx context.Context, d wakeword.Detection) {
 			s.send(ctx, &models.Message{Type: models.TypeTurnCancel, TurnID: s.turnID})
 		}
 	}
+	if d.Source == "server" {
+		// The server spotted the keyword in the audio we streamed to it, so
+		// the idle buffer holds the keyword itself. Replaying that buffer
+		// would count the keyword as the user's request and close an empty
+		// turn before the person says a word.
+		s.idle, s.idleBytes, s.idleAt = nil, 0, time.Time{}
+	}
 	s.startListening(ctx, 0)
 }
 
@@ -245,7 +259,9 @@ func (s *session) onWake(ctx context.Context, d wakeword.Detection) {
 func (s *session) startListening(ctx context.Context, timeout time.Duration) {
 	s.turnSeq++
 	s.turnID = fmt.Sprintf("%s-%d-%d", s.a.cfg.DeviceID, time.Now().Unix(), s.turnSeq)
-	s.speech, s.failed, s.replied, s.remote, s.ending = false, false, false, false, false
+	s.speech, s.confirmed, s.speechDur = false, false, 0
+	s.pending = s.pending[:0]
+	s.failed, s.replied, s.remote, s.ending = false, false, false, false
 	s.maxDB = -120
 	s.announce, s.askListen, s.replyTo = false, false, ""
 	s.preroll = s.preroll[:0]
@@ -258,7 +274,7 @@ func (s *session) startListening(ctx context.Context, timeout time.Duration) {
 	s.ep.Reset(timeout)
 	s.duck(ctx)
 
-	earcon := s.a.playEarcon(ctx, audio.EarconListen)
+	earcon := s.a.PlayEarcon(ctx, audio.EarconListen)
 	if earcon > 0 {
 		s.deafUntil = time.Now().Add(earcon + 80*time.Millisecond)
 	}
@@ -321,17 +337,43 @@ func (s *session) listenFrame(ctx context.Context, f []byte) {
 	switch dec {
 	case vad.Waiting:
 		s.pushPreroll(f)
-	case vad.SpeechStarted:
-		s.speech = true
+	case vad.SpeechStarted, vad.Speaking:
+		if s.confirmed {
+			s.sendAudio(ctx, f)
+			return
+		}
+		// The turn is not sent yet: a click, a cough or the tail of the wake
+		// word would wake the model for silence, and its answer takes seconds.
+		// Audio is held until the utterance is long enough to be speech.
+		if dec == vad.SpeechStarted {
+			s.pending = append(s.pending, s.preroll...)
+			s.preroll = s.preroll[:0]
+		}
+		s.pending = append(s.pending, append([]byte(nil), f...))
+		// Count only frames that are loud enough to be speech: the endpointer
+		// smooths its level over a window, so its Speaking verdict stays true
+		// for a while after a click and would inflate the utterance.
+		if s.ep.IsSpeech(f) {
+			s.speechDur += s.inFormat.Duration(len(f))
+		}
+		if s.speechDur < s.a.cfg.MinUtterance {
+			return
+		}
+		s.speech, s.confirmed = true, true
 		s.send(ctx, &models.Message{Type: models.TypeTurnStart, TurnID: s.turnID, ReplyTo: s.replyTo})
-		for _, p := range s.preroll {
+		for _, p := range s.pending {
 			s.sendAudio(ctx, p)
 		}
-		s.preroll = s.preroll[:0]
-		s.sendAudio(ctx, f)
-	case vad.Speaking:
-		s.sendAudio(ctx, f)
+		s.pending = s.pending[:0]
 	case vad.EndOfUtterance:
+		if !s.confirmed {
+			s.a.log.Info("utterance too short; treated as silence", "turn", s.turnID,
+				"speech_ms", s.speechDur.Milliseconds(), "limit_ms", s.a.cfg.MinUtterance.Milliseconds())
+			s.declineAnswer(ctx)
+			s.a.PlayEarcon(ctx, audio.EarconDone)
+			s.goIdle(ctx)
+			return
+		}
 		s.sendAudio(ctx, f)
 		s.send(ctx, &models.Message{Type: models.TypeTurnEnd, TurnID: s.turnID})
 		s.a.log.Info("utterance captured", "turn", s.turnID, "by", "device", "length", time.Since(s.since).Round(100*time.Millisecond))
@@ -339,7 +381,7 @@ func (s *session) listenFrame(ctx context.Context, f []byte) {
 	case vad.NoSpeech:
 		s.a.log.Info("no speech detected", "max_db", math.Round(s.maxDB), "floor_db", math.Round(s.ep.NoiseFloor()))
 		s.declineAnswer(ctx)
-		s.a.playEarcon(ctx, audio.EarconDone)
+		s.a.PlayEarcon(ctx, audio.EarconDone)
 		s.goIdle(ctx)
 	}
 }
@@ -582,7 +624,7 @@ func (s *session) afterReply(ctx context.Context) {
 		// The answer was passed on.
 		s.replyTo = ""
 		s.goIdle(ctx)
-		s.a.playEarcon(ctx, audio.EarconDone)
+		s.a.PlayEarcon(ctx, audio.EarconDone)
 		return
 	}
 	if s.a.cfg.FollowUp && s.replied && !s.failed && !s.remote && !s.ending {
@@ -591,7 +633,7 @@ func (s *session) afterReply(ctx context.Context) {
 	}
 	s.goIdle(ctx)
 	if s.failed {
-		s.a.playEarcon(ctx, audio.EarconError)
+		s.a.PlayEarcon(ctx, audio.EarconError)
 		s.a.indicator.Show(indicator.Error)
 	}
 }
@@ -601,7 +643,7 @@ func (s *session) checkTimeouts(ctx context.Context) {
 		s.a.log.Warn("server did not reply in time", "turn", s.turnID)
 		s.send(ctx, &models.Message{Type: models.TypeTurnCancel, TurnID: s.turnID})
 		s.goIdle(ctx)
-		s.a.playEarcon(ctx, audio.EarconError)
+		s.a.PlayEarcon(ctx, audio.EarconError)
 		s.a.indicator.Show(indicator.Error)
 	}
 }

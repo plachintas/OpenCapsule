@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/yawaflua/marusya-gemini/internal/audio"
 	"github.com/yawaflua/marusya-gemini/internal/controller"
 	"github.com/yawaflua/marusya-gemini/internal/evdev"
 	"github.com/yawaflua/marusya-gemini/internal/models"
@@ -118,6 +119,10 @@ type Panel struct {
 	Display Overlayer
 	// OnMicMute is called when the microphone is muted or unmuted.
 	OnMicMute func(muted bool)
+	// OnSound plays short feedback for the keys that have no sound of their
+	// own: the microphone key and the volume keys. The centre key already has
+	// an earcon when the assistant starts listening.
+	OnSound func(audio.Earcon)
 	// OnKey, if set, is called for every press and release with the key
 	// name (see [Config.KeyName]), before the key's own action.
 	OnKey  func(name string, code uint16, pressed bool)
@@ -176,7 +181,9 @@ func (p *Panel) Run(ctx context.Context, _ <-chan []byte, out chan<- wakeword.De
 			return err
 
 		case <-repC:
-			p.adjustVolume(ctx, repD)
+			// Holding a volume key must not turn into a machine gun: the
+			// feedback sound belongs to the first press only.
+			p.adjustVolume(ctx, repD, false)
 			repT = time.NewTimer(p.Config.RepeatInterval)
 			repC = repT.C
 
@@ -200,7 +207,7 @@ func (p *Panel) Run(ctx context.Context, _ <-chan []byte, out chan<- wakeword.De
 					if ev.Code == p.Config.VolumeDownKey {
 						repD = -repD
 					}
-					p.adjustVolume(ctx, repD)
+					p.adjustVolume(ctx, repD, true)
 					repT = time.NewTimer(p.Config.RepeatDelay)
 					repC = repT.C
 				}
@@ -243,7 +250,7 @@ func (p *Panel) activate(out chan<- wakeword.Detection) {
 	}
 }
 
-func (p *Panel) adjustVolume(ctx context.Context, delta int) {
+func (p *Panel) adjustVolume(ctx context.Context, delta int, feedback bool) {
 	v := p.Dispatcher.Volume
 	if v == nil {
 		return
@@ -253,6 +260,9 @@ func (p *Panel) adjustVolume(ctx context.Context, delta int) {
 		level := max(0, min(100, st.Level+delta))
 		if err = v.Set(ctx, level); err == nil {
 			p.Display.Overlay(strconv.Itoa(level), 1500*time.Millisecond)
+			if feedback {
+				p.sound(audio.EarconVolume)
+			}
 			return
 		}
 	}
@@ -288,8 +298,21 @@ func (p *Panel) next(ctx context.Context) {
 
 func (p *Panel) toggleMic() {
 	p.muted = !p.muted
-	// No text on the display: the LED ring and the face show the state.
+	// No text on the display: the LED ring and the face show the state, and the
+	// sound says which way the key went.
 	if p.OnMicMute != nil {
 		p.OnMicMute(p.muted)
+	}
+	if p.muted {
+		p.sound(audio.EarconMute)
+	} else {
+		p.sound(audio.EarconUnmute)
+	}
+}
+
+// sound plays feedback if anyone listens.
+func (p *Panel) sound(e audio.Earcon) {
+	if p.OnSound != nil {
+		p.OnSound(e)
 	}
 }
