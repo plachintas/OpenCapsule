@@ -36,6 +36,12 @@ import (
 )
 
 // Config configures the ALSA backend.
+// Muter is an ALSA mixer control that can be switched off, e.g. a
+// [github.com/yawaflua/marusya-gemini/internal/controller/amixer.Volume].
+type Muter interface {
+	SetMuted(ctx context.Context, muted bool) error
+}
+
 type Config struct {
 	// CaptureDevice and PlaybackDevice are ALSA PCM names, e.g. "default",
 	// "plughw:0,0" or a dsnoop/dmix device from asound.conf.
@@ -44,6 +50,10 @@ type Config struct {
 	// ArecordPath and AplayPath override the binaries' locations.
 	ArecordPath string
 	AplayPath   string
+	// Mute silences the amplifier while nothing plays, and unmutes it before
+	// the first sample: the speaker's amplifier hisses on digital silence.
+	// nil disables it.
+	Mute Muter
 	// FrameDuration is the size of captured frames. Defaults to 20 ms.
 	FrameDuration time.Duration
 	Logger        *slog.Logger
@@ -152,7 +162,8 @@ func NewPlayer(cfg Config) *Player {
 }
 
 // Open implements [audio.Player].
-func (p *Player) Open(_ context.Context, f models.AudioFormat) (audio.Stream, error) {
+func (p *Player) Open(ctx context.Context, f models.AudioFormat) (audio.Stream, error) {
+	p.setMuted(ctx, false)
 	cmd := exec.Command(p.cfg.AplayPath, formatArgs(p.cfg.PlaybackDevice, f)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -161,9 +172,19 @@ func (p *Player) Open(_ context.Context, f models.AudioFormat) (audio.Stream, er
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", p.cfg.AplayPath, err)
 	}
-	s := &stream{cmd: cmd, stdin: stdin, queue: make(chan []byte, 2048), done: make(chan struct{})}
+	s := &stream{cmd: cmd, stdin: stdin, queue: make(chan []byte, 2048), done: make(chan struct{}), mute: p.cfg.Mute, log: p.cfg.Logger}
 	go s.loop()
 	return s, nil
+}
+
+// setMuted switches the idle-mute control, if one is configured.
+func (p *Player) setMuted(ctx context.Context, muted bool) {
+	if p.cfg.Mute == nil {
+		return
+	}
+	if err := p.cfg.Mute.SetMuted(ctx, muted); err != nil {
+		p.cfg.Logger.Debug("alsa: idle mute", "muted", muted, "err", err)
+	}
 }
 
 // ErrOverflow is returned when the playback queue is full.
@@ -174,6 +195,8 @@ var errStreamClosed = errors.New("alsa: stream closed")
 
 type stream struct {
 	cmd   *exec.Cmd
+	mute  Muter
+	log   *slog.Logger
 	stdin io.WriteCloser
 	queue chan []byte
 	done  chan struct{}
@@ -195,6 +218,13 @@ func (s *stream) loop() {
 	s.stdin.Close()
 	err := s.cmd.Wait()
 	s.err = errors.Join(werr, err)
+	// The amplifier is silent again: mute the control so it does not hiss on
+	// the idle digital level.
+	if s.mute != nil {
+		if merr := s.mute.SetMuted(context.Background(), true); merr != nil {
+			s.log.Debug("alsa: idle mute", "err", merr)
+		}
+	}
 }
 
 func (s *stream) Write(pcm []byte) error {

@@ -16,6 +16,24 @@ MARUSYA_TIMEZONE=
 MARUSYA_CAPTURE_DEVICE=default
 MARUSYA_PLAYBACK_DEVICE=default
 MARUSYA_MIXER_CONTROL=Master
+
+# Глушит усилитель, пока ничего не играет: на цифровой тишине он шипит.
+# Пример для VK Капсула Мини (Alpine): регулятор "Playback" в карте 0.
+# VAD: сколько ждать и сколько терпеть паузу. SILENCE — пауза внутри фразы,
+# после которой агент считает, что человек закончил (по умолчанию 900ms).
+# MIN_UTTERANCE — минимум речи, чтобы вообще будить модель: щелчок, кашель или
+# хвост ключевого слова короче этого не считаются запросом (по умолчанию 250ms).
+# NO_SPEECH — сколько ждать начала речи после ключевого слова (по умолчанию 6s).
+# MARUSYA_VAD_SILENCE=900ms
+# MARUSYA_VAD_MIN_UTTERANCE=250ms
+# MARUSYA_VAD_NO_SPEECH=6s
+# MARUSYA_VAD_THRESHOLD_DB=12
+# MARUSYA_VAD_SPEECH_START=100ms
+# MARUSYA_RING=auto
+# MARUSYA_RING_REBIND=1   ядро без фикса spi-meson-spicc (до 6.18.63): unbind/bind
+#                         контроллера перед каждым кадром кольца
+# MARUSYA_IDLE_MUTE=Playback
+# MARUSYA_IDLE_MUTE_CARD=0
 # Run this command with the assistant state on every change, e.g. to
 # drive an LED ring owned by another process (see indicator/statecmd).
 MARUSYA_STATE_COMMAND=

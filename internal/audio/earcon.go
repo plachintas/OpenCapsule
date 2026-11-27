@@ -32,6 +32,14 @@ const (
 	EarconError
 	// EarconNotify precedes a message the server sends on its own.
 	EarconNotify
+	// EarconMute is played when the microphone is muted: a falling pair, so
+	// the key feels like "off" without a word.
+	EarconMute
+	// EarconUnmute is played when the microphone is unmuted: the mirror pair.
+	EarconUnmute
+	// EarconVolume is played when the volume keys change the level. One sound
+	// for both directions: the level itself is on the display.
+	EarconVolume
 )
 
 // Render synthesizes the earcon in format f.
@@ -44,6 +52,12 @@ func (e Earcon) Render(f models.AudioFormat) []byte {
 		return slices.Concat(Tone(f, 990, 70, g), Silence(f, 20), Tone(f, 660, 90, g))
 	case EarconNotify:
 		return slices.Concat(Tone(f, 784, 90, g), Silence(f, 30), Tone(f, 988, 90, g), Silence(f, 30), Tone(f, 1175, 140, g))
+	case EarconMute:
+		return slices.Concat(Tone(f, 494, 90, g), Silence(f, 20), Tone(f, 330, 130, g))
+	case EarconUnmute:
+		return slices.Concat(Tone(f, 587, 90, g), Silence(f, 20), Tone(f, 880, 130, g))
+	case EarconVolume:
+		return slices.Concat(Tone(f, 1046, 45, g), Silence(f, 40), Tone(f, 1046, 45, g))
 	default:
 		return slices.Concat(Tone(f, 330, 150, g), Silence(f, 40), Tone(f, 247, 220, g))
 	}

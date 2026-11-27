@@ -42,6 +42,7 @@ import (
 	"github.com/godbus/dbus/v5"
 
 	"github.com/yawaflua/marusya-gemini/internal/agent"
+	"github.com/yawaflua/marusya-gemini/internal/audio"
 	"github.com/yawaflua/marusya-gemini/internal/audio/alsa"
 	"github.com/yawaflua/marusya-gemini/internal/config"
 	"github.com/yawaflua/marusya-gemini/internal/controller"
@@ -95,6 +96,8 @@ var (
 
 	mixerCard    = flag.String("mixer_card", config.Env("MARUSYA_MIXER_CARD", ""), "ALSA card for volume control.")
 	mixerControl = flag.String("mixer_control", config.Env("MARUSYA_MIXER_CONTROL", "Master"), "ALSA simple mixer control for volume. Empty disables volume control.")
+	idleMute     = flag.String("idle_mute", config.Env("MARUSYA_IDLE_MUTE", ""), `ALSA simple mixer control muted while nothing plays, e.g. "Playback"; empty disables. Removes the amplifier hiss on digital silence.`)
+	idleMuteCard = flag.String("idle_mute_card", config.Env("MARUSYA_IDLE_MUTE_CARD", ""), "ALSA card for -idle_mute; empty uses the default card.")
 	volumeCmd    = flag.String("volume_cmd", config.Env("MARUSYA_VOLUME_CMD", ""), "External volume program, called as `<cmd> get`, `<cmd> set <0..100>` and `<cmd> mute on|off`. Takes precedence over mixer_control.")
 
 	bluetooth     = flag.Bool("bluetooth", config.EnvBool("MARUSYA_BLUETOOTH", true), "Enable Bluetooth control via bluetoothctl.")
@@ -107,14 +110,18 @@ var (
 
 	earcons       = flag.Bool("earcons", true, "Play short sounds when listening starts and on errors.")
 	followUp      = flag.Bool("follow_up", true, "Listen for a follow-up question after each reply without the wake word.")
+	replyTimeout  = flag.Duration("reply_timeout", config.EnvDuration("MARUSYA_REPLY_TIMEOUT", 8*time.Second), "How long to wait for the server's reply before giving up on a turn.")
 	serverStreams = flag.Bool("server_streams", config.EnvBool("MARUSYA_SERVER_STREAMS", true), "Play YouTube and other http(s) streams decoded by the server (it needs yt-dlp and ffmpeg).")
 	duckMedia     = flag.Bool("duck_media", true, "Pause music while the assistant is active.")
 	autoUpdate    = flag.Bool("auto_update", config.EnvBool("MARUSYA_AUTO_UPDATE", true), "On every connection, compare the agent binary with the server's (/v1/agent/<arch>); if it differs, download it over this one and restart when idle (supervise-daemon starts the new one).")
 	pluginsDir    = flag.String("plugins_dir", config.Env("MARUSYA_PLUGINS_DIR", ""), "Directory of plugins that run on the speaker, one subdirectory with a plugin.json each (see pkg/pluginsdk). Empty disables plugins.")
 	airplayOn     = flag.Bool("airplay", config.EnvBool("MARUSYA_AIRPLAY", true), "Control AirPlay music played to the speaker (shairport-sync on the system D-Bus): pause, next track, status and ducking go to the phone while it plays.")
 
-	vadThreshold = flag.Float64("vad_threshold_db", vad.DefaultConfig().ThresholdDB, "Speech threshold above the noise floor, dB.")
-	vadSilence   = flag.Duration("vad_silence", vad.DefaultConfig().SilenceEnd, "Trailing silence that ends an utterance.")
+	vadThreshold = flag.Float64("vad_threshold_db", envFloat("MARUSYA_VAD_THRESHOLD_DB", vad.DefaultConfig().ThresholdDB), "Speech threshold above the noise floor, dB.")
+	vadSilence   = flag.Duration("vad_silence", config.EnvDuration("MARUSYA_VAD_SILENCE", vad.DefaultConfig().SilenceEnd), "Trailing silence that ends an utterance: how long a pause the agent tolerates before deciding the person finished.")
+	vadSpeech    = flag.Duration("vad_speech_start", config.EnvDuration("MARUSYA_VAD_SPEECH_START", vad.DefaultConfig().SpeechStart), "How much continuous speech starts an utterance.")
+	vadNoSpeech  = flag.Duration("vad_no_speech", config.EnvDuration("MARUSYA_VAD_NO_SPEECH", vad.DefaultConfig().NoSpeechTimeout), "How long to wait for speech after the wake word before giving up.")
+	vadMinSpeech = flag.Duration("vad_min_utterance", config.EnvDuration("MARUSYA_VAD_MIN_UTTERANCE", 250*time.Millisecond), "An utterance with less speech than this is treated as silence: no turn is sent and the model is not woken.")
 
 	displayMode = flag.String("display", config.Env("MARUSYA_DISPLAY", "auto"), `7-segment face display: "auto", "on" or empty to disable.`)
 	displayDev  = flag.String("display_dev", "", "line-display sysfs directory with map_seg7; auto-detected if empty.")
@@ -130,12 +137,24 @@ var (
 
 	ringMode          = flag.String("ring", config.Env("MARUSYA_RING", "auto"), `LED ring: "auto" (on a VK Capsula Mini, by its device tree), "on" or empty to disable.`)
 	ringDev           = flag.String("ring_dev", config.Env("MARUSYA_RING_DEV", ringled.DefaultDevice), "spidev node of the LED ring.")
+	ringRebind        = flag.Bool("ring_rebind", config.EnvBool("MARUSYA_RING_REBIND", false), "Unbind and bind the SPI controller before every ring frame: only kernels that lose ENH_CTL0 in unprepare_transfer() need it (before the spi-meson-spicc fix of 6.18.63).")
 	ringledBrightness = flag.Int("ringled_brightness", 30, "LED ring brightness, per cent.")
 	ringDemo          = flag.Bool("ring_demo", false, "Play every LED ring animation once and exit.")
 	stateCommand      = flag.String("state_command", config.Env("MARUSYA_STATE_COMMAND", ""), "Run this command with the assistant state (idle, listening, thinking, speaking, error, disconnected, announcing) on every change, e.g. to drive a ring owned by another process.")
 
 	logLevel = flag.String("log_level", config.Env("MARUSYA_LOG_LEVEL", "info"), "Log level: debug, info, warn, error.")
 )
+
+// envFloat reads a float setting from the environment, ignoring garbage: a
+// typo in /etc/conf.d must not stop the agent from starting.
+func envFloat(key string, def float64) float64 {
+	if v := config.Env(key, ""); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
 
 func main() {
 	flag.Parse()
@@ -369,6 +388,16 @@ func run() error {
 	}
 
 	alsaCfg := alsa.Config{CaptureDevice: *captureDevice, PlaybackDevice: *playbackDevice, Logger: log}
+	if *idleMute != "" {
+		mute := &amixer.Volume{Card: *idleMuteCard, Control: *idleMute}
+		alsaCfg.Mute = mute
+		// Nothing plays yet, so start muted: the player unmutes itself before
+		// the first sample. This also covers a run that died mid-playback.
+		if err := mute.SetMuted(context.Background(), true); err != nil {
+			log.Warn("idle mute: mute at start", "err", err)
+		}
+		log.Info("idle mute enabled", "control", *idleMute, "card", *idleMuteCard)
+	}
 	player := alsa.NewPlayer(alsaCfg)
 	// YouTube and other streams decoded by the server; Spotify URIs and
 	// track skipping stay with the media player chosen above.
@@ -389,6 +418,8 @@ func run() error {
 	vadCfg := vad.DefaultConfig()
 	vadCfg.ThresholdDB = *vadThreshold
 	vadCfg.SilenceEnd = *vadSilence
+	vadCfg.SpeechStart = *vadSpeech
+	vadCfg.NoSpeechTimeout = *vadNoSpeech
 
 	var plugins *speakerPlugins
 	if *pluginsDir != "" {
@@ -418,18 +449,21 @@ func run() error {
 		})
 	}
 	a = agent.New(agent.Config{
-		DeviceID:   id,
-		ServerURL:  *serverURL,
-		Token:      *token,
-		Version:    version,
-		AutoUpdate: *autoUpdate,
-		Language:   *language,
-		Location:   *location,
-		TimeZone:   *timezone,
-		VAD:        vadCfg,
-		Earcons:    *earcons,
-		FollowUp:   *followUp,
-		DuckMedia:  *duckMedia,
+		DeviceID:     id,
+		ServerURL:    *serverURL,
+		Token:        *token,
+		Version:      version,
+		AutoUpdate:   *autoUpdate,
+		Language:     *language,
+		Location:     *location,
+		TimeZone:     *timezone,
+		VAD:          vadCfg,
+		MinUtterance: *vadMinSpeech,
+		Earcons:      *earcons,
+		FollowUp:     *followUp,
+		DuckMedia:    *duckMedia,
+
+		ResponseTimeout: *replyTimeout,
 
 		PluginsDir: *pluginsDir,
 
@@ -444,6 +478,9 @@ func run() error {
 		defer streams.Stop()
 	}
 	if touch != nil {
+		// The keys that have no earcon of their own answer with a short tone:
+		// the mute key falls, the unmute key rises, the volume keys click.
+		touch.OnSound = func(e audio.Earcon) { a.PlayEarcon(ctx, e) }
 		touch.OnMicMute = func(muted bool) {
 			a.SetMicMuted(muted)
 			surf.SetMicMuted(muted)
@@ -518,6 +555,9 @@ func ringStrip(log *slog.Logger) (ringled.Strip, string) {
 		return nil, ""
 	}
 	if ringled.Detect() || (*ringMode == "on" && !ringled.LEDsAvailable()) {
+		if *ringRebind {
+			return ringled.NewSPIRebind(*ringDev), "spi " + *ringDev + ", rebind per frame"
+		}
 		return ringled.NewSPI(*ringDev), "spi " + *ringDev
 	}
 	if ringled.LEDsAvailable() {
