@@ -22,6 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"cloud.google.com/go/auth/credentials"
@@ -186,6 +189,30 @@ func (p *Provider) Connect(ctx context.Context, opts provider.SessionOptions) (p
 	return s, nil
 }
 
+// vadSilenceMs is how long Gemini waits in silence before it closes the
+// utterance. The default is generous on purpose: after the wake word people
+// take a moment to start speaking, and the tail of the keyword itself is
+// already in the stream, so a short window ends the turn before the question.
+func vadSilenceMs() int32 {
+	if v := os.Getenv("MARUSYA_VAD_SILENCE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 100 && n <= 10000 {
+			return int32(n)
+		}
+	}
+	return 1500
+}
+
+// vadSensitivity is how eagerly Gemini decides the speech has ended. The API
+// knows only HIGH and LOW; the default is LOW so that a breath in the middle
+// of a question does not close the turn.
+func vadSensitivity() genai.EndSensitivity {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MARUSYA_VAD_SENSITIVITY"))) {
+	case "high", "start", "sensitive":
+		return genai.EndSensitivityHigh
+	}
+	return genai.EndSensitivityLow
+}
+
 func (p *Provider) liveConfig(opts provider.SessionOptions, voice string) *genai.LiveConnectConfig {
 	// By default the device runs its own endpointer and marks turn
 	// boundaries explicitly. With ServerVAD Gemini detects them itself,
@@ -193,9 +220,9 @@ func (p *Provider) liveConfig(opts provider.SessionOptions, voice string) *genai
 	aad := &genai.AutomaticActivityDetection{Disabled: true}
 	if opts.ServerVAD {
 		aad = &genai.AutomaticActivityDetection{
-			EndOfSpeechSensitivity: genai.EndSensitivityHigh,
+			EndOfSpeechSensitivity: vadSensitivity(),
 			PrefixPaddingMs:        genai.Ptr[int32](100),
-			SilenceDurationMs:      genai.Ptr[int32](600),
+			SilenceDurationMs:      genai.Ptr[int32](vadSilenceMs()),
 		}
 	}
 	cfg := &genai.LiveConnectConfig{
@@ -209,6 +236,11 @@ func (p *Provider) liveConfig(opts provider.SessionOptions, voice string) *genai
 		ContextWindowCompression: &genai.ContextWindowCompressionConfig{
 			SlidingWindow: &genai.SlidingWindow{},
 		},
+		// Ask for resumption handles, and pass back the last one to continue
+		// the conversation after the session was closed (our idle timeout or
+		// the backend dropping it). Without it every wake word starts a new
+		// conversation and nothing said before is remembered.
+		SessionResumption: &genai.SessionResumptionConfig{Handle: opts.ResumeHandle},
 	}
 	if opts.SystemInstruction != "" {
 		cfg.SystemInstruction = genai.NewContentFromText(opts.SystemInstruction, genai.RoleUser)

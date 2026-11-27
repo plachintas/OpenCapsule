@@ -95,6 +95,7 @@ var (
 	catalogURL = flag.String("plugin_registry", config.Env("MARUSYA_PLUGIN_REGISTRY", "https://marusya.ywfl.dev"), "Address of the plugin catalog searched in the panel; plugins install from it into -plugins_dir after a SHA-512 check. Empty hides the catalog.")
 	provFile   = flag.String("providers_file", config.Env("MARUSYA_PROVIDERS_FILE", ""), "File that keeps the model providers added in the web panel (with their API keys) across restarts. Empty keeps them in memory.")
 	settings   = flag.String("settings_file", config.Env("MARUSYA_SETTINGS_FILE", ""), "File that keeps the settings changed in the web panel across restarts. Empty keeps them in memory.")
+	resume     = flag.Bool("resume", config.EnvBool("MARUSYA_RESUME", true), "Continue the conversation across session restarts: Gemini keeps a closed session resumable for about two hours, and the next wake word picks it up. Off starts every session from scratch.")
 
 	providerName = flag.String("provider", config.Env("MARUSYA_PROVIDER", "gemini"), `Model backend at startup: "gemini" (Live API, speech to speech), "openai-realtime" (OpenAI Realtime API, speech to speech), "openai" (OpenAI compatible chat + OpenAI speech recognition/TTS), "claude" (Claude + Gemini speech recognition/TTS) or "echo" (loopback, for testing). More providers can be added and switched in the web panel.`)
 	openaiKey    = flag.String("openai_api_key", "", "OpenAI API key. Defaults to $OPENAI_API_KEY.")
@@ -274,6 +275,7 @@ func run() error {
 		WakeURL:           *wakeURL,
 		WakeWords:         *wakeWords,
 		SettingsFile:      *settings,
+		Resume:            *resume,
 		ProfilesFile:      *profiles,
 		AlarmsFile:        *alarmsFile,
 		Version:           version,
